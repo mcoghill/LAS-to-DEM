@@ -47,3 +47,10 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Folders
+*/
+
+# File types
+*.tif
+*.las
