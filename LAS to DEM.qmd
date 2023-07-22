@@ -1,0 +1,96 @@
+---
+title: "LAS to DSM"
+author: "Matthew Coghill"
+format: html
+editor: visual
+---
+
+## LAS to DSM/DEM
+
+This document will be used to convert a LAS file to a DEM or DSM .tif file for use in the DJI Pilot app.
+
+```{r}
+library(lidR)
+library(future)
+library(terra)
+
+```
+
+Load the raw LAS file as a catalog. Tile large LAS file into smaller tiles for easier loading onto most PC's and for faster parallelization.
+
+```{r}
+
+# Give the file path for the LAS file
+raw <- normalizePath(file.path(Sys.getenv("USERPROFILE"), "Thompson Rivers University/TRU UAV-O365 - General/KinsellaBiomassJuly202023/cloud4a2116383090c607.las"))
+
+# Create directory for tile outputs
+tile_dir <- file.path("./01_tile")
+dir.create(tile_dir, showWarnings = FALSE)
+
+# Load the LAS catalog and set alignment and output options
+ctg_raw <- readLAScatalog(raw, chunk_size = 250, chunk_buffer = 0)
+opt_chunk_alignment(ctg_raw) <- c(floor(ctg_raw$Min.X), 
+                                  floor(ctg_raw$Min.Y))
+opt_output_files(ctg_raw) <- file.path(tile_dir, "{XLEFT}_{YBOTTOM}")
+
+# Create parallel environment for tiling, perform the tiling, and create
+# .lax index files.
+plan(multisession, workers = availableCores() / 2)
+set_lidr_threads(2)
+ctg_tile <- catalog_retile(ctg_raw)
+lidR:::catalog_laxindex(ctg_tile)
+
+```
+
+Next, we need to clean away noise and classify the point cloud's ground points.
+
+```{r}
+
+# Function to clean and classify point cloud
+ctg_clean <- function(las) {
+  las <- classify_noise(las, ivf(res = 4, n = 15))
+  las <- filter_poi(las, Classification != LASNOISE)
+  las <- classify_ground(las, csf())
+  return(las)
+}
+
+# Create directory for saving cleaned tiles to
+clean_dir <- file.path("./02_clean")
+dir.create(clean_dir, showWarnings = FALSE)
+
+# Load tiles and set output options
+ctg_tile <- readLAScatalog(tile_dir, chunk_buffer = 12.5)
+opt_output_files(ctg_tile) <- file.path(clean_dir, "{*}")
+
+# Perform custom function and generate .lax index files.
+ctg_ground <- catalog_map(ctg_tile, ctg_clean)
+lidR:::catalog_laxindex(ctg_ground)
+```
+
+Now all that we need to do is generate the DEM or DSM. The output .tif files are saved as "FLT4S" datatype, or "float 4 byte signed values". To get the maximum number of cells that will be in a 20 MB image, we can calculate that in bytes by multiplying (20 \* 1024 \* 1024) / 4. This is the maximum number of cells that we can fit into our output image. The area (m^2^) is found by multiplying the difference in the max and min X and Y coordinates together. We can get the amount of pixels per square meter; thus if we want the pixel size (resolution), we need to invert that. The multiplication by 2 is because of 2 dimensions. Ideally, this should calculate the output resolution, however it could be a bit misrepresented depending on NA values and such.
+
+```{r}
+# Generate TIF file in WGS84 format
+ctg_ground <- readLAScatalog(clean_dir, chunk_buffer = 12.5)
+ctg_bbox <- st_as_sfc(st_bbox(ctg_ground)) |> 
+  st_transform(4326)
+
+# Determine theoretical highest resolution in a 20MB file
+res <- plyr::round_any(
+  2 * (((max(ctg_ground$Max.X) - min(ctg_ground$Min.X)) * 
+    (max(ctg_ground$Max.Y) - min(ctg_ground$Min.Y))) / 
+  (20 * 1024 * 1024 / 4)), accuracy = 0.01, f = ceiling)
+
+# Create and write a DSM
+dsm <- rasterize_canopy(ctg_ground, res = res, algorithm = pitfree()) |> 
+  project("EPSG:4326")
+writeRaster(dsm, paste0(basename(dirname(raw)), "_DSM.tif"), 
+            overwrite = TRUE)
+
+# Create and write a DEM
+# dem <- rasterize_terrain(ctg_ground, res = res, algorithm = tin()) |> 
+#   project("EPSG:4326")
+# writeRaster(dem, paste0(basename(dirname(raw)), "_DEM.tif"), 
+#             overwrite = TRUE)
+
+```
